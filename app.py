@@ -52,8 +52,16 @@ if arquivo is not None:
         st.image(bordas, caption="Bordas (Canny)", use_container_width=True)
 
     # ========== ENVIAR PRO GEMINI ==========
-    if st.button("🔎 Analisar com IA", type="primary"):
+ if st.button("🔎 Analisar com IA", type="primary"):
         with st.spinner("Analisando imagem..."):
+            # Cria o client aqui dentro pra garantir
+            try:
+                chave = st.secrets["GEMINI_API_KEY"]
+            except:
+                chave = CHAVE_GEMINI
+
+            client = genai.Client(api_key=chave)
+
             img1 = Image.fromarray(img_cinza)
             img2 = Image.fromarray(img_clahe)
             img3 = Image.fromarray(bordas)
