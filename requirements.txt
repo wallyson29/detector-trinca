@@ -1,5 +1,5 @@
 streamlit
 google-genai
-opencv-python
+opencv-python-headless
 pillow
 numpy
