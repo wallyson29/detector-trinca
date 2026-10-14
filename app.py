@@ -16,7 +16,6 @@ st.title("🔍 Detector de Trinca em Pino-Rei")
 st.markdown("Tire uma foto ou suba uma imagem para análise automática.")
 
 # ========== CHAVE DA API ==========
-
 try:
     CHAVE_GEMINI = st.secrets["GEMINI_API_KEY"]
 except:
@@ -52,7 +51,7 @@ if arquivo is not None:
         st.image(bordas, caption="Bordas (Canny)", use_container_width=True)
 
     # ========== ENVIAR PRO GEMINI ==========
- if st.button("🔎 Analisar com IA", type="primary"):
+    if st.button("🔎 Analisar com IA", type="primary"):
         with st.spinner("Analisando imagem..."):
             # Cria o client aqui dentro pra garantir
             try:
