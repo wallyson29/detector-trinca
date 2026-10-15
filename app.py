@@ -29,7 +29,7 @@ def aplicar_estilo():
     st.markdown("""
     <style>
     .stApp { background-color: #f8f9fa; }
-    .main .block-container { max-width: 1100px; padding-top: 2rem; padding-bottom: 2rem; }
+    .main .block-container { max-width: 1200px; padding-top: 2rem; padding-bottom: 2rem; }
     h1 { color: #1e3a5f; font-weight: 700; text-align: center; padding-bottom: 0.5rem; }
     h2, h3 { color: #2c5282; font-weight: 600; }
     .subtitulo { text-align: center; color: #6b7280; font-size: 1.05rem; margin-bottom: 2rem; }
@@ -48,6 +48,8 @@ def aplicar_estilo():
     .card-contador .numero { font-size: 2.5rem; font-weight: 700; color: #1e3a5f; line-height: 1; }
     .card-contador .rotulo { color: #6b7280; font-size: 0.9rem; margin-top: 0.5rem; font-weight: 500; }
     .card-contador .sub { color: #9ca3af; font-size: 0.75rem; margin-top: 0.25rem; }
+    .foto-label { background: #f3f4f6; padding: 0.5rem; border-radius: 6px 6px 0 0; font-weight: 600; font-size: 0.85rem; color: #1e3a5f; border: 1px solid #e5e7eb; border-bottom: none; min-height: 3.5rem; display: flex; align-items: center; }
+    .foto-ok { background: #d1fae5 !important; color: #065f46 !important; border-color: #10b981 !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -64,6 +66,18 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # ========== CONSTANTES ==========
 DIAS_MINIMOS_ENTRE_ANALISES = 15
 DOMINIO_FAKE = "@detector.local"
+
+CHECKLIST_FOTOS = [
+    {"id": "foto_pino_rei_1", "label": "1. Pino-rei — 1ª carreta"},
+    {"id": "foto_pino_rei_2", "label": "2. Pino-rei — 2ª carreta"},
+    {"id": "foto_para_lamas_dir", "label": "3. Chassi/para-lamas — 1ª carreta — lado direito + fora"},
+    {"id": "foto_para_lamas_esq", "label": "4. Chassi/para-lamas — 1ª carreta — lado esquerdo + fora"},
+    {"id": "foto_chassi_dir", "label": "5. Chassi — 1ª carreta — lado direito + dentro"},
+    {"id": "foto_chassi_esq", "label": "6. Chassi — 1ª carreta — lado esquerdo + dentro"},
+    {"id": "foto_porca_dir", "label": "7. Porca do berço — direito"},
+    {"id": "foto_porca_esq", "label": "8. Porca do berço — esquerdo"},
+    {"id": "foto_placa", "label": "9. Foto da placa do caminhão"},
+]
 
 # ========== ESTADO DA SESSÃO ==========
 if "usuario" not in st.session_state:
@@ -110,13 +124,11 @@ if st.session_state.access_token:
 # FUNÇÕES AUXILIARES
 # ============================================================
 def username_para_email(username):
-    """Converte username em email fake pro Supabase Auth."""
     username_limpo = username.lower().replace(" ", "").replace("-", "").strip()
     return f"{username_limpo}{DOMINIO_FAKE}"
 
 
 def validar_username(username):
-    """Valida o formato do username."""
     if not username or len(username) < 3:
         return False, "Nome de usuário precisa ter pelo menos 3 caracteres"
     if len(username) > 30:
@@ -145,13 +157,11 @@ def fazer_login(username, senha):
 
 def fazer_cadastro(username, senha, filial_id):
     try:
-        # Verifica se o username já existe
         existe = supabase.table("profiles").select("id").eq("username", username).execute()
         if existe.data:
             return False, "Este nome de usuário já está em uso. Escolha outro."
 
         email = username_para_email(username)
-
         resposta = supabase.auth.sign_up({
             "email": email,
             "password": senha
@@ -397,113 +407,6 @@ def buscar_historico(filial_id=None, placa=None, dias=None, user_id=None, limite
 
 
 # ============================================================
-# FUNÇÕES DE PDF
-# ============================================================
-def gerar_pdf_analise(analise):
-    try:
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(
-            buffer, pagesize=A4,
-            leftMargin=2*cm, rightMargin=2*cm,
-            topMargin=2*cm, bottomMargin=2*cm
-        )
-
-        styles = getSampleStyleSheet()
-        estilo_titulo = ParagraphStyle('Titulo', parent=styles['Heading1'], fontSize=20, textColor=colors.HexColor('#1e3a5f'), alignment=TA_CENTER, spaceAfter=20)
-        estilo_sub = ParagraphStyle('Sub', parent=styles['Heading2'], fontSize=14, textColor=colors.HexColor('#2c5282'), spaceAfter=10, spaceBefore=15)
-        estilo_corpo = ParagraphStyle('Corpo', parent=styles['BodyText'], fontSize=11, leading=16)
-
-        elementos = []
-        elementos.append(Paragraph("🔍 Detector de Trinca", estilo_titulo))
-        elementos.append(Paragraph(
-            "Relatório de Inspeção de Pino-Rei / Quinta Roda",
-            ParagraphStyle('sub', parent=styles['Normal'], alignment=TA_CENTER, fontSize=12, textColor=colors.HexColor('#6b7280'))
-        ))
-        elementos.append(Spacer(1, 20))
-
-        placa = formatar_placa(analise.get("placa", "—"))
-        data = analise.get("created_at", "")[:19].replace("T", " ")
-        quem = nome_usuario(analise.get("user_id"))
-        filial = nome_filial(analise.get("filial_id"))
-        forcado = "⚠️ SIM (fora do prazo)" if analise.get("forcado") else "Não"
-
-        elementos.append(Paragraph("📋 Dados da Inspeção", estilo_sub))
-        dados_tabela = [
-            ["Placa do veículo", placa],
-            ["Data/Hora", data],
-            ["Técnico responsável", quem],
-            ["Filial", filial],
-            ["Análise forçada", forcado],
-        ]
-        t = Table(dados_tabela, colWidths=[5*cm, 10*cm])
-        t.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f3f4f6')),
-            ('TEXTCOLOR', (0, 0), (0, -1), colors.HexColor('#1e3a5f')),
-            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-            ('TOPPADDING', (0, 0), (-1, -1), 8),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
-        ]))
-        elementos.append(t)
-        elementos.append(Spacer(1, 15))
-
-        elementos.append(Paragraph("🤖 Resultado da Análise por IA", estilo_sub))
-        resultado_tabela = [
-            ["Tem trinca?", analise.get("tem_trinca", "—")],
-            ["Gravidade", analise.get("gravidade", "—")],
-            ["Recomendação", analise.get("recomendacao", "—")],
-            ["Confiança", analise.get("confianca", "—")],
-        ]
-        t2 = Table(resultado_tabela, colWidths=[5*cm, 10*cm])
-        t2.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f3f4f6')),
-            ('TEXTCOLOR', (0, 0), (0, -1), colors.HexColor('#1e3a5f')),
-            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-            ('TOPPADDING', (0, 0), (-1, -1), 8),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
-        ]))
-        elementos.append(t2)
-        elementos.append(Spacer(1, 15))
-
-        url_img = analise.get("foto_marcada_url")
-        if url_img:
-            try:
-                r = http_requests.get(url_img, timeout=10)
-                if r.status_code == 200:
-                    img_buffer = io.BytesIO(r.content)
-                    elementos.append(Paragraph("📸 Imagem com marcação", estilo_sub))
-                    img = RLImage(img_buffer, width=14*cm, height=10*cm, kind='proportional')
-                    elementos.append(img)
-                    elementos.append(Spacer(1, 15))
-            except Exception:
-                pass
-
-        elementos.append(Paragraph("📝 Laudo Técnico Completo", estilo_sub))
-        laudo_txt = analise.get("laudo", "—")
-        for paragrafo in laudo_txt.split("\n"):
-            if paragrafo.strip():
-                elementos.append(Paragraph(
-                    paragrafo.replace("<", "&lt;").replace(">", "&gt;"),
-                    estilo_corpo
-                ))
-
-        elementos.append(Spacer(1, 30))
-        elementos.append(Paragraph(
-            f"Documento gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-            ParagraphStyle('rodape', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor('#9ca3af'), alignment=TA_CENTER)
-        ))
-
-        doc.build(elementos)
-        buffer.seek(0)
-        return buffer.getvalue(), None
-    except Exception as e:
-        return None, str(e)
-
-
-# ============================================================
 # FUNÇÕES DE SALVAMENTO DE ANÁLISE
 # ============================================================
 def fazer_upload_imagem(imagem_np, user_id, nome_arquivo):
@@ -550,35 +453,35 @@ def extrair_campos_laudo(texto):
     return campos
 
 
-def salvar_analise(perfil, placa, img_cinza, img_marcada_bgr, texto_laudo, forcado=False):
+def salvar_analise(perfil, placa, fotos_urls, texto_laudo, foto_observacao_url=None, texto_observacao=None, forcado=False):
+    """
+    fotos_urls: dict com as chaves do CHECKLIST_FOTOS -> URL
+    """
     try:
         user_id = perfil["id"]
         filial_id = perfil["filial_id"]
 
-        url_original, erro1 = fazer_upload_imagem(img_cinza, user_id, "original")
-        if erro1:
-            return False, f"Erro no upload da original: {erro1}"
-
-        url_marcada, erro2 = fazer_upload_imagem(img_marcada_bgr, user_id, "marcada")
-        if erro2:
-            return False, f"Erro no upload da marcada: {erro2}"
-
-        campos = extrair_campos_laudo(texto_laudo)
-
-        supabase.table("analises").insert({
+        dados = {
             "user_id": user_id,
             "filial_id": filial_id,
             "placa": normalizar_placa(placa),
-            "foto_original_url": url_original,
-            "foto_marcada_url": url_marcada,
             "laudo": texto_laudo,
-            "tem_trinca": campos["tem_trinca"],
-            "gravidade": campos["gravidade"],
-            "recomendacao": campos["recomendacao"],
-            "confianca": campos["confianca"],
             "forcado": forcado,
-        }).execute()
+            "foto_observacao": foto_observacao_url,
+            "texto_observacao": texto_observacao,
+        }
 
+        campos = extrair_campos_laudo(texto_laudo)
+        dados["tem_trinca"] = campos["tem_trinca"]
+        dados["gravidade"] = campos["gravidade"]
+        dados["recomendacao"] = campos["recomendacao"]
+        dados["confianca"] = campos["confianca"]
+
+        # Adiciona as URLs das 9 fotos obrigatórias
+        for item in CHECKLIST_FOTOS:
+            dados[item["id"]] = fotos_urls.get(item["id"])
+
+        supabase.table("analises").insert(dados).execute()
         return True, None
     except Exception as e:
         return False, str(e)
@@ -971,14 +874,25 @@ def aba_historico():
                     st.rerun()
             if st.session_state.get(f"mostrar_{a['id']}"):
                 st.markdown("---")
-                col_d1, col_d2 = st.columns([1, 1])
-                with col_d1:
-                    st.markdown("**📸 Imagem com marcação**")
-                    if a.get("foto_marcada_url"):
-                        st.image(a["foto_marcada_url"], use_container_width=True)
-                with col_d2:
-                    st.markdown("**📋 Laudo**")
-                    st.markdown(a.get("laudo", "—"))
+                st.markdown("**📸 Fotos da inspeção**")
+                cols_fotos = st.columns(3)
+                for i, item in enumerate(CHECKLIST_FOTOS):
+                    url = a.get(item["id"])
+                    if url:
+                        with cols_fotos[i % 3]:
+                            st.image(url, caption=item["label"], use_container_width=True)
+
+                if a.get("foto_observacao"):
+                    st.markdown("**📸 Foto de observação**")
+                    st.image(a["foto_observacao"], use_container_width=True)
+
+                if a.get("texto_observacao"):
+                    st.markdown("**📝 Observação do técnico**")
+                    st.info(a["texto_observacao"])
+
+                st.markdown("---")
+                st.markdown("**📋 Laudo**")
+                st.markdown(a.get("laudo", "—"))
                 if a.get("forcado"):
                     st.caption("⚠️ Esta análise foi FORÇADA (fora do prazo de 15 dias)")
                 st.markdown("---")
@@ -998,11 +912,188 @@ def aba_historico():
 
 
 # ============================================================
-# TELA DE ANÁLISE
+# FUNÇÃO AUXILIAR — MOSTRAR FOTOS DE UMA ANÁLISE
+# ============================================================
+def mostrar_fotos_analise(analise):
+    """Mostra as 9 fotos + observação de uma análise."""
+    st.markdown("**📸 Fotos da inspeção**")
+    cols = st.columns(3)
+    for i, item in enumerate(CHECKLIST_FOTOS):
+        url = analise.get(item["id"])
+        if url:
+            with cols[i % 3]:
+                st.image(url, caption=item["label"], use_container_width=True)
+
+    if analise.get("foto_observacao"):
+        st.markdown("**📸 Foto de observação**")
+        st.image(analise["foto_observacao"], use_container_width=True)
+
+    if analise.get("texto_observacao"):
+        st.markdown("**📝 Observação do técnico**")
+        st.info(analise["texto_observacao"])
+
+
+# ============================================================
+# FUNÇÕES DE PDF
+# ============================================================
+def gerar_pdf_analise(analise):
+    try:
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buffer, pagesize=A4,
+            leftMargin=2*cm, rightMargin=2*cm,
+            topMargin=2*cm, bottomMargin=2*cm
+        )
+
+        styles = getSampleStyleSheet()
+        estilo_titulo = ParagraphStyle('Titulo', parent=styles['Heading1'], fontSize=20, textColor=colors.HexColor('#1e3a5f'), alignment=TA_CENTER, spaceAfter=20)
+        estilo_sub = ParagraphStyle('Sub', parent=styles['Heading2'], fontSize=14, textColor=colors.HexColor('#2c5282'), spaceAfter=10, spaceBefore=15)
+        estilo_corpo = ParagraphStyle('Corpo', parent=styles['BodyText'], fontSize=11, leading=16)
+        estilo_legenda = ParagraphStyle('Legenda', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor('#6b7280'), alignment=TA_CENTER)
+
+        elementos = []
+        elementos.append(Paragraph("🔍 Detector de Trinca", estilo_titulo))
+        elementos.append(Paragraph(
+            "Relatório de Inspeção de Pino-Rei / Quinta Roda",
+            ParagraphStyle('sub', parent=styles['Normal'], alignment=TA_CENTER, fontSize=12, textColor=colors.HexColor('#6b7280'))
+        ))
+        elementos.append(Spacer(1, 20))
+
+        placa = formatar_placa(analise.get("placa", "—"))
+        data = analise.get("created_at", "")[:19].replace("T", " ")
+        quem = nome_usuario(analise.get("user_id"))
+        filial = nome_filial(analise.get("filial_id"))
+        forcado = "⚠️ SIM (fora do prazo)" if analise.get("forcado") else "Não"
+
+        elementos.append(Paragraph("📋 Dados da Inspeção", estilo_sub))
+        dados_tabela = [
+            ["Placa do veículo", placa],
+            ["Data/Hora", data],
+            ["Técnico responsável", quem],
+            ["Filial", filial],
+            ["Análise forçada", forcado],
+        ]
+        t = Table(dados_tabela, colWidths=[5*cm, 10*cm])
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f3f4f6')),
+            ('TEXTCOLOR', (0, 0), (0, -1), colors.HexColor('#1e3a5f')),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+        ]))
+        elementos.append(t)
+        elementos.append(Spacer(1, 15))
+
+        elementos.append(Paragraph("🤖 Resultado da Análise por IA", estilo_sub))
+        resultado_tabela = [
+            ["Tem trinca?", analise.get("tem_trinca", "—")],
+            ["Gravidade", analise.get("gravidade", "—")],
+            ["Recomendação", analise.get("recomendacao", "—")],
+            ["Confiança", analise.get("confianca", "—")],
+        ]
+        t2 = Table(resultado_tabela, colWidths=[5*cm, 10*cm])
+        t2.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f3f4f6')),
+            ('TEXTCOLOR', (0, 0), (0, -1), colors.HexColor('#1e3a5f')),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+        ]))
+        elementos.append(t2)
+        elementos.append(Spacer(1, 15))
+
+        # ========== FOTOS DO CHECKLIST ==========
+        elementos.append(Paragraph("📸 Fotos da Inspeção", estilo_sub))
+
+        # Agrupa em pares (2 por linha)
+        fotos_validas = [(item["label"], analise.get(item["id"])) for item in CHECKLIST_FOTOS if analise.get(item["id"])]
+
+        for i in range(0, len(fotos_validas), 2):
+            par = fotos_validas[i:i+2]
+            linha_imgs = []
+            linha_legendas = []
+            for label, url in par:
+                try:
+                    r = http_requests.get(url, timeout=10)
+                    if r.status_code == 200:
+                        img_buffer = io.BytesIO(r.content)
+                        img = RLImage(img_buffer, width=7*cm, height=5*cm, kind='proportional')
+                        linha_imgs.append(img)
+                        linha_legendas.append(Paragraph(label, estilo_legenda))
+                    else:
+                        linha_imgs.append(Paragraph("(falha ao carregar)", estilo_corpo))
+                        linha_legendas.append(Paragraph(label, estilo_legenda))
+                except Exception:
+                    linha_imgs.append(Paragraph("(falha ao carregar)", estilo_corpo))
+                    linha_legendas.append(Paragraph(label, estilo_legenda))
+
+            if linha_imgs:
+                tabela_fotos = Table(
+                    [linha_imgs, linha_legendas],
+                    colWidths=[8*cm, 8*cm]
+                )
+                tabela_fotos.setStyle(TableStyle([
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                    ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ]))
+                elementos.append(tabela_fotos)
+                elementos.append(Spacer(1, 8))
+
+        # Foto de observação
+        if analise.get("foto_observacao"):
+            try:
+                r = http_requests.get(analise["foto_observacao"], timeout=10)
+                if r.status_code == 200:
+                    img_buffer = io.BytesIO(r.content)
+                    elementos.append(Paragraph("📸 Foto de Observação", estilo_sub))
+                    img = RLImage(img_buffer, width=14*cm, height=10*cm, kind='proportional')
+                    elementos.append(img)
+                    elementos.append(Spacer(1, 10))
+            except Exception:
+                pass
+
+        # Texto de observação
+        if analise.get("texto_observacao"):
+            elementos.append(Paragraph("📝 Observação do Técnico", estilo_sub))
+            elementos.append(Paragraph(
+                analise["texto_observacao"].replace("<", "&lt;").replace(">", "&gt;"),
+                estilo_corpo
+            ))
+
+        elementos.append(Paragraph("📝 Laudo Técnico Completo", estilo_sub))
+        laudo_txt = analise.get("laudo", "—")
+        for paragrafo in laudo_txt.split("\n"):
+            if paragrafo.strip():
+                elementos.append(Paragraph(
+                    paragrafo.replace("<", "&lt;").replace(">", "&gt;"),
+                    estilo_corpo
+                ))
+
+        elementos.append(Spacer(1, 30))
+        elementos.append(Paragraph(
+            f"Documento gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+            ParagraphStyle('rodape', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor('#9ca3af'), alignment=TA_CENTER)
+        ))
+
+        doc.build(elementos)
+        buffer.seek(0)
+        return buffer.getvalue(), None
+    except Exception as e:
+        return None, str(e)
+
+
+# ============================================================
+# TELA DE ANÁLISE (NOVA — 9 FOTOS + OBSERVAÇÃO)
 # ============================================================
 def tela_analise(perfil):
     st.title("🔍 Detector de Trinca")
-    st.markdown("<p class='subtitulo'>Informe a placa e suba a foto para análise automática</p>", unsafe_allow_html=True)
+    st.markdown("<p class='subtitulo'>Inspeção completa do conjunto de engate</p>", unsafe_allow_html=True)
 
     placa_input = st.text_input("🚗 Placa do caminhão", placeholder="RSB-1A56 ou ABC-1234", key="placa_input")
 
@@ -1036,6 +1127,7 @@ def tela_analise(perfil):
                     st.session_state.bloqueado_15dias = False
                     st.success(f"✅ Placa {formatar_placa(placa_normalizada)} — última análise há {dias} dias. Pode analisar.")
 
+    # ========== BLOQUEIO POR < 15 DIAS ==========
     if st.session_state.bloqueado_15dias and st.session_state.ultima_analise_placa:
         u = st.session_state.ultima_analise_placa
         dias = dias_desde(u["created_at"])
@@ -1081,16 +1173,10 @@ def tela_analise(perfil):
             st.markdown("---")
             st.subheader("📄 Laudo anterior")
             with st.container(border=True):
-                col_l1, col_l2 = st.columns([1, 1])
-                with col_l1:
-                    st.markdown("**📸 Imagem com marcação**")
-                    if u.get("foto_marcada_url"):
-                        st.image(u["foto_marcada_url"], use_container_width=True)
-                    else:
-                        st.caption("Sem imagem salva")
-                with col_l2:
-                    st.markdown("**📋 Laudo**")
-                    st.markdown(u.get("laudo", "—"))
+                mostrar_fotos_analise(u)
+                st.markdown("---")
+                st.markdown("**📋 Laudo**")
+                st.markdown(u.get("laudo", "—"))
                 st.markdown("---")
                 st.caption(f"👤 {quem} • 🏢 {filial} • 📅 {u['created_at'][:19]} • 🚗 {formatar_placa(u['placa'])}")
                 if u.get("forcado"):
@@ -1105,122 +1191,163 @@ def tela_analise(perfil):
                 st.session_state.ver_laudo_anterior = None
                 st.rerun()
 
+    # ========== LIBERA ANÁLISE ==========
     placa_ok = st.session_state.placa_validada is not None
     nao_bloqueado = not st.session_state.bloqueado_15dias
 
     if placa_ok and nao_bloqueado:
         st.markdown("---")
-        arquivo = st.file_uploader("📸 Escolha a foto do pino-rei ou quinta roda", type=["jpg", "jpeg", "png"])
+        st.markdown("### 📸 Checklist de Fotos")
+        st.caption("Todas as 9 fotos são obrigatórias. A IA analisa as 8 primeiras (a placa é só registro).")
 
-        if arquivo is not None:
-            bytes_img = arquivo.read()
-            img_array = np.frombuffer(bytes_img, np.uint8)
-            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-            img_cinza = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if st.session_state.forcar_analise:
+            st.warning("⚠️ Análise FORÇADA (fora do prazo de 15 dias)")
 
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            img_clahe = clahe.apply(img_cinza)
-            bordas = cv2.Canny(img_clahe, 50, 150)
+        # Upload das 9 fotos em grid 3x3
+        fotos_upload = {}
+        total_ok = 0
 
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.image(img_cinza, caption="Original (cinza)", use_container_width=True)
-            with col2:
-                st.image(img_clahe, caption="CLAHE (realce)", use_container_width=True)
-            with col3:
-                st.image(bordas, caption="Bordas (Canny)", use_container_width=True)
+        for linha in range(3):
+            cols = st.columns(3)
+            for col in range(3):
+                idx = linha * 3 + col
+                if idx >= len(CHECKLIST_FOTOS):
+                    break
+                item = CHECKLIST_FOTOS[idx]
+                with cols[col]:
+                    label_ok = "✅" if st.session_state.get(f"uploaded_{item['id']}") else "📤"
+                    st.markdown(f"**{label_ok} {item['label']}**")
+                    arquivo = st.file_uploader(
+                        item["label"],
+                        type=["jpg", "jpeg", "png"],
+                        key=f"upload_{item['id']}",
+                        label_visibility="collapsed"
+                    )
+                    if arquivo:
+                        fotos_upload[item["id"]] = arquivo
+                        st.session_state[f"uploaded_{item['id']}"] = True
+                        total_ok += 1
+                    else:
+                        st.session_state[f"uploaded_{item['id']}"] = False
 
-            if st.session_state.forcar_analise:
-                st.warning("⚠️ Análise FORÇADA (fora do prazo de 15 dias)")
+        st.markdown("---")
+        st.markdown(f"**Progresso:** {total_ok}/9 fotos anexadas")
 
+        # Campo de observação
+        with st.expander("📝 Observação (opcional)", expanded=False):
+            foto_obs = st.file_uploader(
+                "Foto de peça trincada (fora do checklist)",
+                type=["jpg", "jpeg", "png"],
+                key="upload_observacao"
+            )
+            texto_obs = st.text_area(
+                "Descrição da observação",
+                placeholder="Ex: Encontrei trinca no suporte do para-lama traseiro",
+                key="texto_observacao_input"
+            )
+
+        # Botão Analisar (só libera se todas as 9 estiverem)
+        if total_ok == 9:
+            st.markdown("---")
             if st.button("🔎 Analisar com IA", type="primary", use_container_width=True):
-                with st.spinner("Analisando imagem..."):
-                    client = genai.Client(api_key=CHAVE_GEMINI)
-                    img1 = Image.fromarray(img_cinza)
-                    img2 = Image.fromarray(img_clahe)
-                    img3 = Image.fromarray(bordas)
+                with st.spinner("Processando as 9 fotos..."):
+                    try:
+                        # Processa cada foto (cinza + CLAHE + Canny)
+                        imagens_processadas = []
+                        fotos_urls = {}
 
-                    prompt = """Você é um inspetor técnico especializado em pino-rei e quinta roda
-de caminhão. Analise as 3 imagens (original em cinza, realce CLAHE e bordas).
+                        client = genai.Client(api_key=CHAVE_GEMINI)
 
-Responda de forma estruturada:
+                        # ========== UPLOAD DAS FOTOS ==========
+                        for item in CHECKLIST_FOTOS:
+                            arquivo = fotos_upload.get(item["id"])
+                            if arquivo:
+                                bytes_img = arquivo.read()
+                                img_array = np.frombuffer(bytes_img, np.uint8)
+                                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                                img_cinza = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
+                                # Upload pro Storage (imagem em cor original, não cinza)
+                                url, erro = fazer_upload_imagem(img, perfil["id"], item["id"])
+                                if url:
+                                    fotos_urls[item["id"]] = url
+
+                                # Prepara versão processada pra IA
+                                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                                img_clahe = clahe.apply(img_cinza)
+                                imagens_processadas.append((item["label"], img_clahe))
+
+                        # Upload da observação
+                        foto_obs_url = None
+                        if foto_obs:
+                            bytes_obs = foto_obs.read()
+                            arr_obs = np.frombuffer(bytes_obs, np.uint8)
+                            img_obs = cv2.imdecode(arr_obs, cv2.IMREAD_COLOR)
+                            foto_obs_url, _ = fazer_upload_imagem(img_obs, perfil["id"], "observacao")
+
+                        # ========== MONTA PROMPT ==========
+                        lista_pecas = "\n".join([
+                            f"{i+1}. {item['label']}"
+                            for i, item in enumerate(CHECKLIST_FOTOS[:8])
+                        ])
+
+                        texto_obs_para_ia = ""
+                        if texto_obs and texto_obs.strip():
+                            texto_obs_para_ia = f"\n\nObservação do técnico: {texto_obs.strip()}"
+
+                        prompt = f"""Você é um inspetor técnico especializado em pino-rei, quinta roda e conjunto de engate de caminhão.
+
+Analise as 8 fotos enviadas nesta ordem:
+{lista_pecas}
+{texto_obs_para_ia}
+
+Para CADA peça, avalie se há sinais de trinca, rachadura ou fissura.
+
+Responda EXATAMENTE neste formato:
+
+PEÇA 1 (nome): OK ou TRINCA [gravidade]
+PEÇA 2 (nome): OK ou TRINCA [gravidade]
+... (até peça 8)
+
+RESUMO:
 1. TEM TRINCA? (SIM / NÃO / NÃO SEI)
-2. Se SIM, onde está localizada?
-3. Gravidade: (LEVE / MODERADA / SEVERA)
+2. Se SIM, em quais peças? (liste os números)
+3. Gravidade geral: (LEVE / MODERADA / SEVERA)
 4. Recomendação: (LIBERAR / INSPECIONAR / SUBSTITUIR)
 5. Confiança: (ALTA / MÉDIA / BAIXA)
 
-REGRAS PARA AS COORDENADAS:
-- Adicione no final uma linha EXATAMENTE assim:
-  COORDENADAS: [y_min, x_min, y_max, x_max]
-- Valores entre 0 e 1000 (0,0 = canto superior esquerdo)
-- A caixa deve envolver APENAS a trinca, não a peça toda
-- Seja preciso: uma trinca fina deve gerar uma caixa fina
-- Se a trinca for pequena, a caixa deve ser pequena (menos de 30% da imagem)
-- Se não houver trinca: [0, 0, 0, 0]
+Seja objetivo e técnico."""
 
-Exemplo de resposta correta para uma trinca pequena no centro:
-COORDENADAS: [420, 380, 560, 520]"""
+                        # ========== ENVIA PRA IA ==========
+                        contents = [prompt]
+                        for label, img_proc in imagens_processadas[:8]:
+                            contents.append(Image.fromarray(img_proc))
 
-                    try:
                         resposta = client.models.generate_content(
                             model="gemini-3.5-flash-lite",
-                            contents=[prompt, img1, img2, img3]
+                            contents=contents
                         )
                         texto_laudo = resposta.text
 
-                        coords = None
-                        match = re.search(r'COORDENADAS:\s*\[([\d,\s]+)\]', texto_laudo)
-                        if match:
-                            valores = [int(x.strip()) for x in match.group(1).split(',')]
-                            if len(valores) == 4 and sum(valores) > 0:
-                                coords = valores
-                            texto_laudo = re.sub(r'COORDENADAS:\s*\[[\d,\s]+\]', '', texto_laudo).strip()
-
-                        img_marcada_bgr = None
-
-                        if coords:
-                            y_min, x_min, y_max, x_max = coords
-                            h, w = img_cinza.shape
-                            x1 = int((x_min / 1000) * w)
-                            y1 = int((y_min / 1000) * h)
-                            x2 = int((x_max / 1000) * w)
-                            y2 = int((y_max / 1000) * h)
-                            largura_max = int(w * 0.5)
-                            altura_max = int(h * 0.5)
-                            if (x2 - x1) > largura_max:
-                                cx = (x1 + x2) // 2
-                                x1 = cx - largura_max // 2
-                                x2 = cx + largura_max // 2
-                            if (y2 - y1) > altura_max:
-                                cy = (y1 + y2) // 2
-                                y1 = cy - altura_max // 2
-                                y2 = cy + altura_max // 2
-                            x1 = max(0, min(x1, w - 1))
-                            y1 = max(0, min(y1, h - 1))
-                            x2 = max(0, min(x2, w - 1))
-                            y2 = max(0, min(y2, h - 1))
-                            img_marcada_bgr = img.copy()
-                            cv2.rectangle(img_marcada_bgr, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                            cv2.putText(img_marcada_bgr, "TRINCA", (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                            img_marcada_rgb = cv2.cvtColor(img_marcada_bgr, cv2.COLOR_BGR2RGB)
-                            col_a, col_b = st.columns([1, 1])
-                            with col_a:
-                                st.subheader("📸 Imagem com marcação")
-                                st.image(img_marcada_rgb, use_container_width=True)
-                            with col_b:
-                                st.subheader("📋 Laudo da IA")
-                                st.markdown(texto_laudo)
-                        else:
-                            st.subheader("📋 Laudo da IA")
-                            st.markdown(texto_laudo)
-
+                        # ========== MOSTRA RESULTADO ==========
+                        st.success("✅ Análise concluída!")
                         st.markdown("---")
+                        st.subheader("📋 Laudo da IA")
+                        st.markdown(texto_laudo)
+                        st.markdown("---")
+
+                        # ========== SALVA NO BANCO ==========
                         with st.spinner("💾 Salvando análise..."):
-                            if img_marcada_bgr is None:
-                                img_marcada_bgr = img.copy()
-                            ok, erro = salvar_analise(perfil, st.session_state.placa_validada, img_cinza, img_marcada_bgr, texto_laudo, forcado=st.session_state.forcar_analise)
+                            ok, erro = salvar_analise(
+                                perfil,
+                                st.session_state.placa_validada,
+                                fotos_urls,
+                                texto_laudo,
+                                foto_observacao_url=foto_obs_url,
+                                texto_observacao=texto_obs if texto_obs else None,
+                                forcado=st.session_state.forcar_analise
+                            )
+
                             if ok:
                                 st.success("💾 Análise salva no histórico!")
 
@@ -1241,6 +1368,13 @@ COORDENADAS: [420, 380, 560, 520]"""
                                             else:
                                                 st.error(f"Erro ao gerar PDF: {erro_pdf}")
 
+                                # Limpa os uploads
+                                for item in CHECKLIST_FOTOS:
+                                    if f"upload_{item['id']}" in st.session_state:
+                                        del st.session_state[f"upload_{item['id']}"]
+                                    if f"uploaded_{item['id']}" in st.session_state:
+                                        del st.session_state[f"uploaded_{item['id']}"]
+
                                 st.session_state.forcar_analise = False
                                 st.session_state.placa_validada = None
                                 st.session_state.ultima_analise_placa = None
@@ -1248,9 +1382,12 @@ COORDENADAS: [420, 380, 560, 520]"""
                                 st.session_state.ver_laudo_anterior = None
                             else:
                                 st.warning(f"Análise gerada mas não foi possível salvar: {erro}")
-                        st.markdown("---")
+
                     except Exception as e:
                         st.error(f"Erro ao analisar: {e}")
+        else:
+            faltando = 9 - total_ok
+            st.info(f"📸 Faltam **{faltando}** foto(s) para liberar a análise.")
 
 
 # ============================================================
