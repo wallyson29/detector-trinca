@@ -63,6 +63,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ========== CONSTANTES ==========
 DIAS_MINIMOS_ENTRE_ANALISES = 15
+DOMINIO_FAKE = "@detector.local"
 
 # ========== ESTADO DA SESSÃO ==========
 if "usuario" not in st.session_state:
@@ -108,8 +109,26 @@ if st.session_state.access_token:
 # ============================================================
 # FUNÇÕES AUXILIARES
 # ============================================================
-def fazer_login(email, senha):
+def username_para_email(username):
+    """Converte username em email fake pro Supabase Auth."""
+    username_limpo = username.lower().replace(" ", "").replace("-", "").strip()
+    return f"{username_limpo}{DOMINIO_FAKE}"
+
+
+def validar_username(username):
+    """Valida o formato do username."""
+    if not username or len(username) < 3:
+        return False, "Nome de usuário precisa ter pelo menos 3 caracteres"
+    if len(username) > 30:
+        return False, "Nome de usuário muito longo (máximo 30 caracteres)"
+    if not re.match(r'^[a-zA-Z0-9._-]+$', username):
+        return False, "Use apenas letras, números, ponto, hífen ou underline"
+    return True, None
+
+
+def fazer_login(username, senha):
     try:
+        email = username_para_email(username)
         resposta = supabase.auth.sign_in_with_password({
             "email": email,
             "password": senha
@@ -118,11 +137,21 @@ def fazer_login(email, senha):
         st.session_state.refresh_token = resposta.session.refresh_token
         return resposta.user, None
     except Exception as e:
-        return None, str(e)
+        erro_str = str(e)
+        if "Invalid login credentials" in erro_str:
+            return None, "Nome de usuário ou senha incorretos"
+        return None, erro_str
 
 
-def fazer_cadastro(email, senha, username, filial_id):
+def fazer_cadastro(username, senha, filial_id):
     try:
+        # Verifica se o username já existe
+        existe = supabase.table("profiles").select("id").eq("username", username).execute()
+        if existe.data:
+            return False, "Este nome de usuário já está em uso. Escolha outro."
+
+        email = username_para_email(username)
+
         resposta = supabase.auth.sign_up({
             "email": email,
             "password": senha
@@ -139,7 +168,10 @@ def fazer_cadastro(email, senha, username, filial_id):
 
         return True, None
     except Exception as e:
-        return False, str(e)
+        erro_str = str(e)
+        if "already registered" in erro_str.lower():
+            return False, "Este nome de usuário já está em uso"
+        return False, erro_str
 
 
 def buscar_perfil(user_id):
@@ -568,14 +600,14 @@ def tela_login():
         with st.container(border=True):
             st.markdown("### 🔐 Acesso")
             st.markdown("<br>", unsafe_allow_html=True)
-            email = st.text_input("📧 Email", key="login_email")
+            username = st.text_input("👤 Nome de usuário", key="login_username", placeholder="Ex: joao.silva")
             senha = st.text_input("🔒 Senha", type="password", key="login_senha")
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Entrar", type="primary", use_container_width=True):
-                if not email or not senha:
-                    st.warning("Preencha email e senha.")
+                if not username or not senha:
+                    st.warning("Preencha nome de usuário e senha.")
                 else:
-                    user, erro = fazer_login(email, senha)
+                    user, erro = fazer_login(username.strip(), senha)
                     if erro:
                         st.error(f"Erro no login: {erro}")
                     else:
@@ -602,9 +634,11 @@ def tela_cadastro():
         </div>
         """, unsafe_allow_html=True)
         with st.container(border=True):
-            email = st.text_input("📧 Email", key="cad_email")
+            username = st.text_input("👤 Nome de usuário", key="cad_username", placeholder="Ex: joao.silva")
+            st.caption("Use apenas letras, números, ponto, hífen ou underline (3-30 caracteres)")
             senha = st.text_input("🔒 Senha (mínimo 6 caracteres)", type="password", key="cad_senha")
-            username = st.text_input("👤 Nome de usuário", key="cad_username")
+            confirmar = st.text_input("🔒 Confirme a senha", type="password", key="cad_confirmar")
+
             filiais = listar_filiais()
             if filiais:
                 opcoes = {f["nome"]: f["id"] for f in filiais}
@@ -613,14 +647,20 @@ def tela_cadastro():
             else:
                 st.error("Nenhuma filial cadastrada. Contate o administrador.")
                 filial_id = None
+
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Cadastrar", type="primary", use_container_width=True):
-                if not email or not senha or not username or not filial_id:
-                    st.warning("Preencha todos os campos.")
-                elif len(senha) < 6:
+                valido, msg = validar_username(username)
+                if not valido:
+                    st.warning(msg)
+                elif not senha or len(senha) < 6:
                     st.warning("A senha precisa ter pelo menos 6 caracteres.")
+                elif senha != confirmar:
+                    st.warning("As senhas não coincidem.")
+                elif not filial_id:
+                    st.warning("Selecione uma filial.")
                 else:
-                    ok, erro = fazer_cadastro(email, senha, username, filial_id)
+                    ok, erro = fazer_cadastro(username.strip(), senha, filial_id)
                     if ok:
                         st.success("✅ Cadastro realizado! Aguarde aprovação do administrador.")
                         st.info("Depois de aprovado, você poderá fazer login.")
@@ -1013,7 +1053,6 @@ def tela_analise(perfil):
             f"É necessário aguardar **{DIAS_MINIMOS_ENTRE_ANALISES} dias** entre análises da mesma placa."
         )
 
-        # ========== BOTÕES: VER LAUDO + BAIXAR PDF ==========
         col_v1, col_v2, col_v3 = st.columns([1, 1, 2])
         with col_v1:
             if st.button("📄 Ver laudo", use_container_width=True):
@@ -1185,7 +1224,6 @@ COORDENADAS: [420, 380, 560, 520]"""
                             if ok:
                                 st.success("💾 Análise salva no histórico!")
 
-                                # ========== BOTÃO PDF PÓS-ANÁLISE ==========
                                 ultima_salva = buscar_ultima_analise_placa(st.session_state.placa_validada)
                                 if ultima_salva:
                                     st.markdown("<br>", unsafe_allow_html=True)
