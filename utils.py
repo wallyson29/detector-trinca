@@ -7,6 +7,7 @@ from config import (
     LIMIAR_NITIDEZ,
     LIMIAR_BRILHO_MIN,
     LIMIAR_BRILHO_MAX,
+    LIMIAR_DENSIDADE_BORDAS,
     RESOLUCAO_MIN_LARGURA,
     RESOLUCAO_MIN_ALTURA,
 )
@@ -79,21 +80,16 @@ def verificar_qualidade_foto(arquivo_bytes):
         h_original, w_original = img.shape[:2]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # ========== MÉTRICA 1: NITIDEZ (Laplaciano SEM blur, na original) ==========
+        # Métrica 1: nitidez
         nitidez = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-        # ========== MÉTRICA 2: DENSIDADE DE BORDAS (Canny) ==========
-        # Conta quantos pixels são "borda" na imagem.
-        # Foto focada: muitas bordas definidas. Foto borrada: poucas bordas.
+        # Métrica 2: densidade de bordas
         bordas = cv2.Canny(gray, 50, 150)
         densidade_bordas = np.count_nonzero(bordas) / (h_original * w_original) * 100
-        # Retorna em percentual (0-100). Foto boa costuma dar 2-15%.
 
         brilho = float(np.mean(gray))
 
-        # ========== CRITÉRIOS DE APROVAÇÃO ==========
-        # Foto boa: nitidez >= 50 OU densidade de bordas >= 1.5%
-        # Foto borrada: nitidez < 50 E densidade < 1.5%
+        # Critério: passa se nitidez OU densidade atender
         foto_boa = (nitidez >= LIMIAR_NITIDEZ) or (densidade_bordas >= LIMIAR_DENSIDADE_BORDAS)
 
         problemas = []
@@ -122,6 +118,7 @@ def verificar_qualidade_foto(arquivo_bytes):
         return True, "✅ Foto OK", metricas
     except Exception as e:
         return False, f"Erro ao verificar: {e}", {}
+
 
 # ========== EXTRAÇÃO DE CAMPOS DO LAUDO ==========
 def extrair_campos_laudo(texto):
