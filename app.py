@@ -70,10 +70,10 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 DIAS_MINIMOS_ENTRE_ANALISES = 15
 DOMINIO_FAKE = "@detector.local"
 
-# Limiares de qualidade da foto
-LIMIAR_NITIDEZ = 200      # variância do Laplaciano
-LIMIAR_BRILHO_MIN = 60    # luminância mínima
-LIMIAR_BRILHO_MAX = 200   # luminância máxima
+# ========== LIMIARES DE QUALIDADE (AJUSTADOS) ==========
+LIMIAR_NITIDEZ = 100          # aceita a partir de 100
+LIMIAR_BRILHO_MIN = 100       # brilho mínimo 100
+LIMIAR_BRILHO_MAX = 220       # brilho máximo 220
 RESOLUCAO_MIN_LARGURA = 800
 RESOLUCAO_MIN_ALTURA = 600
 
@@ -290,25 +290,28 @@ def verificar_qualidade_foto(arquivo_bytes):
             return False, "Não foi possível ler a imagem", {}
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # 1. Nitidez (variância do Laplaciano)
-        nitidez = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-        # 2. Brilho (luminância média)
-        brilho = float(np.mean(gray))
-
-        # 3. Resolução
         h, w = img.shape[:2]
+
+        # Nitidez por quadrantes (pega a maior)
+        nitidezes = []
+        for i in range(2):
+            for j in range(2):
+                q = gray[i*h//2:(i+1)*h//2, j*w//2:(j+1)*w//2]
+                if q.size > 0:
+                    nitidezes.append(cv2.Laplacian(q, cv2.CV_64F).var())
+        nitidez = max(nitidezes) if nitidezes else 0
+
+        brilho = float(np.mean(gray))
 
         problemas = []
         if nitidez < LIMIAR_NITIDEZ:
-            problemas.append(f"foto desfocada/borrada (nitidez: {nitidez:.0f})")
+            problemas.append(f"foto desfocada (nitidez: {nitidez:.0f}, mínimo {LIMIAR_NITIDEZ})")
         if brilho < LIMIAR_BRILHO_MIN:
-            problemas.append(f"foto muito escura (brilho: {brilho:.0f})")
+            problemas.append(f"foto muito escura (brilho: {brilho:.0f}, mínimo {LIMIAR_BRILHO_MIN})")
         elif brilho > LIMIAR_BRILHO_MAX:
-            problemas.append(f"foto muito clara/estourada (brilho: {brilho:.0f})")
+            problemas.append(f"foto muito clara (brilho: {brilho:.0f}, máximo {LIMIAR_BRILHO_MAX})")
         if w < RESOLUCAO_MIN_LARGURA or h < RESOLUCAO_MIN_ALTURA:
-            problemas.append(f"resolução baixa ({w}x{h}, mínimo {RESOLUCAO_MIN_LARGURA}x{RESOLUCAO_MIN_ALTURA})")
+            problemas.append(f"resolução baixa ({w}x{h})")
 
         metricas = {
             "nitidez": nitidez,
@@ -320,8 +323,7 @@ def verificar_qualidade_foto(arquivo_bytes):
         }
 
         if problemas:
-            msg = "⚠️ " + " • ".join(problemas)
-            return False, msg, metricas
+            return False, "❌ " + " • ".join(problemas), metricas
 
         return True, "✅ Foto OK", metricas
     except Exception as e:
@@ -517,10 +519,6 @@ def fazer_upload_imagem(imagem_np, user_id, nome_arquivo):
 # FUNÇÃO DE ANÁLISE POR PEÇA (COM RETRY)
 # ============================================================
 def analisar_peca(client, img_original_bgr, nome_peca):
-    """
-    Analisa 1 peça com 2 imagens (original + CLAHE).
-    Faz retry automático em caso de erro 503.
-    """
     max_tentativas = 3
     espera = 5
 
@@ -563,7 +561,6 @@ Seja objetivo e técnico."""
             )
             texto = resposta.text
 
-            # Se chegou aqui, funcionou. Extrai os campos.
             status = "NAO_SEI"
             match = re.search(r'STATUS:\s*\**\s*(OK|TRINCA_LEVE|TRINCA_MODERADA|TRINCA_SEVERA|NAO_SEI)', texto, re.IGNORECASE)
             if match:
@@ -653,7 +650,6 @@ Seja objetivo e técnico."""
 
 
 def gerar_laudo_consolidado(resultados, placa):
-    """Monta o laudo consolidado a partir dos resultados por peça."""
     linhas = [f"LAUDO DE INSPEÇÃO — PLACA {placa}", ""]
 
     tem_trinca_geral = False
@@ -1373,7 +1369,7 @@ def gerar_pdf_analise(analise):
 
 
 # ============================================================
-# TELA DE ANÁLISE (1 PEÇA POR VEZ + VERIFICAÇÃO DE QUALIDADE)
+# TELA DE ANÁLISE
 # ============================================================
 def tela_analise(perfil):
     st.title("🔍 Detector de Trinca")
@@ -1481,13 +1477,11 @@ def tela_analise(perfil):
     if placa_ok and nao_bloqueado:
         st.markdown("---")
         st.markdown("### 📸 Checklist de Fotos")
-        st.caption("Todas as 9 fotos são obrigatórias. A IA analisa as 8 primeiras (a placa é só registro).")
-        st.caption("📋 **Critérios de qualidade:** nitidez mínima, brilho adequado e resolução ≥ 800x600.")
+        st.caption(f"Todas as 9 fotos são obrigatórias. Critérios: nitidez ≥ {LIMIAR_NITIDEZ}, brilho entre {LIMIAR_BRILHO_MIN} e {LIMIAR_BRILHO_MAX}, resolução ≥ {RESOLUCAO_MIN_LARGURA}x{RESOLUCAO_MIN_ALTURA}.")
 
         if st.session_state.forcar_analise:
             st.warning("⚠️ Análise FORÇADA (fora do prazo de 15 dias)")
 
-        # Admin pode desabilitar a verificação de qualidade
         pular_verificacao = False
         if perfil["role"] == "admin":
             pular_verificacao = st.checkbox(
@@ -1496,9 +1490,8 @@ def tela_analise(perfil):
                 key="pular_verificacao_admin"
             )
             if pular_verificacao:
-                st.warning("⚠️ Verificação de qualidade DESATIVADA pelo admin. Fotos ruins podem ir pra IA.")
+                st.warning("⚠️ Verificação de qualidade DESATIVADA pelo admin.")
 
-        # Upload em grid 3x3
         fotos_upload = {}
         fotos_qualidade = {}
         total_ok = 0
@@ -1521,17 +1514,12 @@ def tela_analise(perfil):
                         label_visibility="collapsed"
                     )
                     if arquivo:
-                        # Verifica qualidade
                         if pular_verificacao:
                             ok_q, msg_q, metricas_q = True, "✅ Verificação pulada (admin)", {}
                         else:
                             ok_q, msg_q, metricas_q = verificar_qualidade_foto(arquivo.getvalue())
 
-                        fotos_qualidade[item["id"]] = {
-                            "ok": ok_q,
-                            "msg": msg_q,
-                            "metricas": metricas_q,
-                        }
+                        fotos_qualidade[item["id"]] = {"ok": ok_q, "msg": msg_q, "metricas": metricas_q}
 
                         if ok_q:
                             fotos_upload[item["id"]] = arquivo
@@ -1543,7 +1531,7 @@ def tela_analise(perfil):
                         else:
                             st.session_state[f"uploaded_{item['id']}"] = False
                             total_ruim += 1
-                            st.error(f"❌ {msg_q}")
+                            st.error(msg_q)
                             if metricas_q:
                                 exibir_metricas(metricas_q)
                     else:
@@ -1567,7 +1555,6 @@ def tela_analise(perfil):
                 key="texto_observacao_input"
             )
 
-        # Botão Analisar (só libera se todas as 9 estão OK)
         if total_ok == 9:
             st.markdown("---")
             if st.button("🔎 Analisar com IA", type="primary", use_container_width=True):
@@ -1575,7 +1562,6 @@ def tela_analise(perfil):
                     try:
                         client = genai.Client(api_key=CHAVE_GEMINI)
 
-                        # ========== UPLOAD DAS FOTOS ==========
                         fotos_urls = {}
                         fotos_brutas = {}
 
@@ -1594,7 +1580,6 @@ def tela_analise(perfil):
                             img_obs = cv2.imdecode(arr_obs, cv2.IMREAD_COLOR)
                             foto_obs_url, _ = fazer_upload_imagem(img_obs, perfil["id"], "observacao")
 
-                        # ========== ANÁLISE PEÇA POR PEÇA ==========
                         resultados = {}
                         pecas_para_analisar = [item for item in CHECKLIST_FOTOS if item["analisar"]]
                         total_pecas = len(pecas_para_analisar)
@@ -1624,7 +1609,6 @@ def tela_analise(perfil):
 
                             barra_progresso.progress((i + 1) / total_pecas)
 
-                        # Upload da placa
                         if "foto_placa" in fotos_brutas:
                             url_placa, _ = fazer_upload_imagem(fotos_brutas["foto_placa"], perfil["id"], "foto_placa")
                             fotos_urls["foto_placa"] = url_placa
@@ -1668,7 +1652,6 @@ def tela_analise(perfil):
             if faltando > 0:
                 st.info(f"📸 Faltam **{faltando}** foto(s) válida(s) para liberar a análise.")
 
-        # ========== MOSTRA RESULTADO SE TIVER ==========
         if st.session_state.get("resultado_analise"):
             res = st.session_state.resultado_analise
             st.markdown("---")
