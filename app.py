@@ -51,6 +51,7 @@ def aplicar_estilo():
     .card-contador .sub { color: #9ca3af; font-size: 0.75rem; margin-top: 0.25rem; }
     .peca-ok { background: #d1fae5; padding: 1rem; border-radius: 8px; border-left: 4px solid #10b981; margin-bottom: 0.5rem; }
     .peca-trinca { background: #fee2e2; padding: 1rem; border-radius: 8px; border-left: 4px solid #ef4444; margin-bottom: 0.5rem; }
+    .peca-erro { background: #fef3c7; padding: 1rem; border-radius: 8px; border-left: 4px solid #f59e0b; margin-bottom: 0.5rem; }
     .metricas-ok { color: #10b981; font-size: 0.75rem; font-weight: 600; }
     .metricas-ruim { color: #ef4444; font-size: 0.75rem; font-weight: 600; }
     </style>
@@ -70,10 +71,10 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 DIAS_MINIMOS_ENTRE_ANALISES = 15
 DOMINIO_FAKE = "@detector.local"
 
-# ========== LIMIARES DE QUALIDADE (AJUSTADOS) ==========
-LIMIAR_NITIDEZ = 100          # aceita a partir de 100
-LIMIAR_BRILHO_MIN = 100       # brilho mínimo 100
-LIMIAR_BRILHO_MAX = 220       # brilho máximo 220
+# ========== LIMIARES DE QUALIDADE ==========
+LIMIAR_NITIDEZ = 100
+LIMIAR_BRILHO_MIN = 100
+LIMIAR_BRILHO_MAX = 220
 RESOLUCAO_MIN_LARGURA = 800
 RESOLUCAO_MIN_ALTURA = 600
 
@@ -117,8 +118,8 @@ if "ultima_analise_placa" not in st.session_state:
 if "bloqueado_15dias" not in st.session_state:
     st.session_state.bloqueado_15dias = False
 
-if "resultado_analise" not in st.session_state:
-    st.session_state.resultado_analise = None
+if "analise_em_andamento" not in st.session_state:
+    st.session_state.analise_em_andamento = None
 
 # ========== REAUTENTICAR SESSÃO ==========
 if st.session_state.access_token:
@@ -279,10 +280,6 @@ def dias_desde(data_iso):
 # FUNÇÃO DE VERIFICAÇÃO DE QUALIDADE DA FOTO
 # ============================================================
 def verificar_qualidade_foto(arquivo_bytes):
-    """
-    Verifica qualidade da foto ANTES de mandar pra IA.
-    Retorna (ok, mensagem, metricas).
-    """
     try:
         arr = np.frombuffer(arquivo_bytes, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -292,7 +289,6 @@ def verificar_qualidade_foto(arquivo_bytes):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         h, w = img.shape[:2]
 
-        # Nitidez por quadrantes (pega a maior)
         nitidezes = []
         for i in range(2):
             for j in range(2):
@@ -331,7 +327,6 @@ def verificar_qualidade_foto(arquivo_bytes):
 
 
 def exibir_metricas(metricas):
-    """Exibe as métricas de qualidade da foto em formato amigável."""
     if not metricas:
         return
     nit_ok = "metricas-ok" if metricas.get("ok_nitidez") else "metricas-ruim"
@@ -649,13 +644,56 @@ Seja objetivo e técnico."""
             }
 
 
+def analisar_pecas_selecionadas(client, pecas_para_analisar, fotos_brutas, perfil, resultados_existentes=None):
+    """
+    Analisa um subconjunto de peças (só as que precisam).
+    Retorna (resultados, fotos_urls, erros).
+    """
+    resultados = resultados_existentes.copy() if resultados_existentes else {}
+    fotos_urls = {}
+    erros = []
+
+    total_pecas = len(pecas_para_analisar)
+
+    barra_progresso = st.progress(0)
+    status_texto = st.empty()
+
+    for i, item in enumerate(pecas_para_analisar):
+        status_texto.markdown(f"**Analisando peça {i+1}/{total_pecas}:** {item['label']}...")
+
+        img_original = fotos_brutas.get(item["id"])
+        if img_original is None:
+            erros.append(item)
+            barra_progresso.progress((i + 1) / total_pecas)
+            continue
+
+        resultado = analisar_peca(client, img_original, item["label"])
+
+        if resultado["status"] == "ERRO":
+            erros.append(item)
+            status_texto.markdown(f"**Analisando peça {i+1}/{total_pecas}:** {item['label']}... 🟡 **ERRO**")
+        else:
+            resultados[item["id"]] = resultado
+            url_marcada, _ = fazer_upload_imagem(resultado["img_marcada"], perfil["id"], item["id"])
+            fotos_urls[item["id"]] = url_marcada
+
+            if resultado["status"].startswith("TRINCA"):
+                status_texto.markdown(f"**Analisando peça {i+1}/{total_pecas}:** {item['label']}... 🔴 **TRINCA**")
+            elif resultado["status"] == "OK":
+                status_texto.markdown(f"**Analisando peça {i+1}/{total_pecas}:** {item['label']}... ✅ OK")
+            else:
+                status_texto.markdown(f"**Analisando peça {i+1}/{total_pecas}:** {item['label']}... 🟡 {resultado['status']}")
+
+        barra_progresso.progress((i + 1) / total_pecas)
+
+    return resultados, fotos_urls, erros
+
+
 def gerar_laudo_consolidado(resultados, placa):
     linhas = [f"LAUDO DE INSPEÇÃO — PLACA {placa}", ""]
 
     tem_trinca_geral = False
-    tem_erro = False
     pecas_com_trinca = []
-    pecas_com_erro = []
     gravidades = []
     confiancas = []
 
@@ -667,11 +705,7 @@ def gerar_laudo_consolidado(resultados, placa):
             continue
 
         status = res["status"]
-        if status == "ERRO":
-            emoji = "🟡"
-            tem_erro = True
-            pecas_com_erro.append(f"{i+1}. {item['label']}")
-        elif status.startswith("TRINCA"):
+        if status.startswith("TRINCA"):
             emoji = "🔴"
             tem_trinca_geral = True
             pecas_com_trinca.append(f"{i+1}. {item['label']}")
@@ -691,14 +725,7 @@ def gerar_laudo_consolidado(resultados, placa):
 
     linhas.append("")
     linhas.append("RESUMO:")
-
-    if tem_erro:
-        linhas.append(f"⚠️ ANÁLISE INCOMPLETA — {len(pecas_com_erro)} peça(s) não puderam ser analisadas")
-        linhas.append(f"   Peças com erro: {', '.join(pecas_com_erro)}")
-        linhas.append("   Recomendação: Refazer a análise dessas peças manualmente")
-        linhas.append("")
-
-    linhas.append(f"1. TEM TRINCA? {'SIM' if tem_trinca_geral else ('NÃO SEI' if tem_erro else 'NÃO')}")
+    linhas.append(f"1. TEM TRINCA? {'SIM' if tem_trinca_geral else 'NÃO'}")
     if pecas_com_trinca:
         linhas.append(f"2. Peças com trinca: {', '.join(pecas_com_trinca)}")
     else:
@@ -714,7 +741,7 @@ def gerar_laudo_consolidado(resultados, placa):
             linhas.append("4. Recomendação: INSPECIONAR")
     else:
         linhas.append("3. Gravidade geral: —")
-        linhas.append("4. Recomendação: LIBERAR" if not tem_erro else "4. Recomendação: REFAZER ANÁLISE")
+        linhas.append("4. Recomendação: LIBERAR")
 
     if confiancas:
         if "BAIXA" in confiancas:
@@ -741,7 +768,7 @@ def extrair_campos_laudo(texto):
     if match:
         campos["gravidade"] = match.group(1).upper()
 
-    match = re.search(r'Recomenda[çc][ãa]o[:\s]*\**\s*(LIBERAR|INSPECIONAR|SUBSTITUIR|REFAZER)', texto, re.IGNORECASE)
+    match = re.search(r'Recomenda[çc][ãa]o[:\s]*\**\s*(LIBERAR|INSPECIONAR|SUBSTITUIR)', texto, re.IGNORECASE)
     if match:
         campos["recomendacao"] = match.group(1).upper()
 
@@ -1392,7 +1419,7 @@ def tela_analise(perfil):
                 st.session_state.forcar_analise = False
                 st.session_state.ultima_analise_placa = None
                 st.session_state.bloqueado_15dias = False
-                st.session_state.resultado_analise = None
+                st.session_state.analise_em_andamento = None
 
             ultima = buscar_ultima_analise_placa(placa_normalizada)
             st.session_state.ultima_analise_placa = ultima
@@ -1544,6 +1571,7 @@ def tela_analise(perfil):
             st.warning(f"⚠️ {total_ruim} foto(s) com qualidade ruim. Corrija antes de analisar.")
 
         with st.expander("📝 Observação (opcional)", expanded=False):
+            st.caption("Use este campo para registrar qualquer anormalidade fora do checklist. Não passa pela IA.")
             foto_obs = st.file_uploader(
                 "Foto de peça trincada (fora do checklist)",
                 type=["jpg", "jpeg", "png"],
@@ -1555,131 +1583,198 @@ def tela_analise(perfil):
                 key="texto_observacao_input"
             )
 
+        # ========== ESTADO DE ANÁLISE ==========
         if total_ok == 9:
             st.markdown("---")
-            if st.button("🔎 Analisar com IA", type="primary", use_container_width=True):
-                with st.spinner("Preparando análise..."):
-                    try:
-                        client = genai.Client(api_key=CHAVE_GEMINI)
 
-                        fotos_urls = {}
-                        fotos_brutas = {}
+            # Botão Analisar (só aparece se não tem análise em andamento)
+            if st.session_state.analise_em_andamento is None:
+                if st.button("🔎 Analisar com IA", type="primary", use_container_width=True):
+                    with st.spinner("Preparando análise..."):
+                        try:
+                            client = genai.Client(api_key=CHAVE_GEMINI)
 
-                        for item in CHECKLIST_FOTOS:
-                            arquivo = fotos_upload.get(item["id"])
-                            if arquivo:
-                                bytes_img = arquivo.read()
-                                img_array = np.frombuffer(bytes_img, np.uint8)
-                                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-                                fotos_brutas[item["id"]] = img
+                            # Upload da observação (só salva)
+                            foto_obs_url = None
+                            if foto_obs:
+                                bytes_obs = foto_obs.read()
+                                arr_obs = np.frombuffer(bytes_obs, np.uint8)
+                                img_obs = cv2.imdecode(arr_obs, cv2.IMREAD_COLOR)
+                                foto_obs_url, _ = fazer_upload_imagem(img_obs, perfil["id"], "observacao")
 
-                        foto_obs_url = None
-                        if foto_obs:
-                            bytes_obs = foto_obs.read()
-                            arr_obs = np.frombuffer(bytes_obs, np.uint8)
-                            img_obs = cv2.imdecode(arr_obs, cv2.IMREAD_COLOR)
-                            foto_obs_url, _ = fazer_upload_imagem(img_obs, perfil["id"], "observacao")
+                            # Preparar fotos brutas
+                            fotos_brutas = {}
+                            for item in CHECKLIST_FOTOS:
+                                arquivo = fotos_upload.get(item["id"])
+                                if arquivo:
+                                    bytes_img = arquivo.read()
+                                    img_array = np.frombuffer(bytes_img, np.uint8)
+                                    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                                    fotos_brutas[item["id"]] = img
 
-                        resultados = {}
-                        pecas_para_analisar = [item for item in CHECKLIST_FOTOS if item["analisar"]]
-                        total_pecas = len(pecas_para_analisar)
-
-                        barra_progresso = st.progress(0)
-                        status_texto = st.empty()
-
-                        for i, item in enumerate(pecas_para_analisar):
-                            status_texto.markdown(f"**Analisando peça {i+1}/{total_pecas}:** {item['label']}...")
-
-                            img_original = fotos_brutas.get(item["id"])
-                            if img_original is None:
-                                continue
-
-                            resultado = analisar_peca(client, img_original, item["label"])
-                            resultados[item["id"]] = resultado
-
-                            url_marcada, _ = fazer_upload_imagem(resultado["img_marcada"], perfil["id"], item["id"])
-                            fotos_urls[item["id"]] = url_marcada
-
-                            if resultado["status"].startswith("TRINCA"):
-                                status_texto.markdown(f"**Analisando peça {i+1}/{total_pecas}:** {item['label']}... 🔴 **TRINCA**")
-                            elif resultado["status"] == "OK":
-                                status_texto.markdown(f"**Analisando peça {i+1}/{total_pecas}:** {item['label']}... ✅ OK")
-                            else:
-                                status_texto.markdown(f"**Analisando peça {i+1}/{total_pecas}:** {item['label']}... 🟡 {resultado['status']}")
-
-                            barra_progresso.progress((i + 1) / total_pecas)
-
-                        if "foto_placa" in fotos_brutas:
-                            url_placa, _ = fazer_upload_imagem(fotos_brutas["foto_placa"], perfil["id"], "foto_placa")
-                            fotos_urls["foto_placa"] = url_placa
-
-                        status_texto.markdown("**✅ Análise concluída!**")
-
-                        texto_laudo = gerar_laudo_consolidado(resultados, formatar_placa(st.session_state.placa_validada))
-
-                        with st.spinner("💾 Salvando análise..."):
-                            ok, erro = salvar_analise_completa(
-                                perfil,
-                                st.session_state.placa_validada,
-                                resultados,
-                                fotos_urls,
-                                texto_laudo,
-                                foto_observacao_url=foto_obs_url,
-                                texto_observacao=texto_obs if texto_obs else None,
-                                forcado=st.session_state.forcar_analise
+                            # Analisa as 8 peças técnicas
+                            pecas_para_analisar = [item for item in CHECKLIST_FOTOS if item["analisar"]]
+                            resultados, fotos_urls, erros = analisar_pecas_selecionadas(
+                                client, pecas_para_analisar, fotos_brutas, perfil
                             )
 
-                            if ok:
-                                st.success("💾 Análise salva com sucesso!")
-                                st.session_state.resultado_analise = {
-                                    "resultados": resultados,
-                                    "laudo": texto_laudo,
-                                    "placa": st.session_state.placa_validada,
-                                }
-                                st.session_state.forcar_analise = False
-                                st.session_state.placa_validada = None
-                                st.session_state.ultima_analise_placa = None
-                                st.session_state.bloqueado_15dias = False
-                                st.session_state.ver_laudo_anterior = None
-                                st.rerun()
-                            else:
-                                st.warning(f"Análise gerada mas não foi possível salvar: {erro}")
+                            # Upload da placa
+                            if "foto_placa" in fotos_brutas:
+                                url_placa, _ = fazer_upload_imagem(fotos_brutas["foto_placa"], perfil["id"], "foto_placa")
+                                fotos_urls["foto_placa"] = url_placa
 
-                    except Exception as e:
-                        st.error(f"Erro na análise: {e}")
+                            st.session_state.analise_em_andamento = {
+                                "resultados": resultados,
+                                "fotos_urls": fotos_urls,
+                                "erros": erros,
+                                "fotos_brutas": fotos_brutas,
+                                "foto_obs_url": foto_obs_url,
+                                "texto_obs": texto_obs if texto_obs else None,
+                            }
+
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro na análise: {e}")
+
+            # ========== MOSTRA ESTADO DA ANÁLISE ==========
+            if st.session_state.analise_em_andamento:
+                estado = st.session_state.analise_em_andamento
+                resultados = estado["resultados"]
+                fotos_urls = estado["fotos_urls"]
+                erros = estado["erros"]
+                fotos_brutas = estado["fotos_brutas"]
+                foto_obs_url = estado["foto_obs_url"]
+                texto_obs_salvo = estado["texto_obs"]
+
+                st.markdown("---")
+                st.subheader("📋 Resultado parcial da análise")
+
+                for item in CHECKLIST_FOTOS:
+                    if not item["analisar"]:
+                        continue
+                    r = resultados.get(item["id"])
+                    if not r:
+                        st.markdown(
+                            f'<div class="peca-erro">🟡 <b>{item["label"]}</b> — NÃO ANALISADA (erro)</div>',
+                            unsafe_allow_html=True
+                        )
+                    elif r["status"].startswith("TRINCA"):
+                        st.markdown(
+                            f'<div class="peca-trinca">🔴 <b>{item["label"]}</b> — {r["status"]}<br><small>{r.get("observacao", "")}</small></div>',
+                            unsafe_allow_html=True
+                        )
+                    elif r["status"] == "OK":
+                        st.markdown(
+                            f'<div class="peca-ok">✅ <b>{item["label"]}</b> — OK</div>',
+                            unsafe_allow_html=True
+                        )
+                    else:
+                        st.markdown(
+                            f'<div class="peca-ok">🟡 <b>{item["label"]}</b> — {r["status"]}</div>',
+                            unsafe_allow_html=True
+                        )
+
+                if erros:
+                    st.markdown("---")
+                    st.error(
+                        f"⚠️ **{len(erros)} peça(s) NÃO puderam ser analisadas.** "
+                        f"O laudo só será concluído quando TODAS as peças forem analisadas com sucesso."
+                    )
+
+                    st.markdown("**Peças com erro:**")
+                    for item_erro in erros:
+                        st.markdown(f"- 🔴 {item_erro['label']}")
+
+                    st.markdown("---")
+                    col_r1, col_r2 = st.columns([1, 1])
+                    with col_r1:
+                        if st.button("🔄 Reanalisar peças com erro", type="primary", use_container_width=True):
+                            with st.spinner(f"Reanalisando {len(erros)} peça(s)..."):
+                                try:
+                                    client = genai.Client(api_key=CHAVE_GEMINI)
+                                    novos_resultados, novas_urls, novos_erros = analisar_pecas_selecionadas(
+                                        client,
+                                        erros,
+                                        fotos_brutas,
+                                        perfil,
+                                        resultados_existentes=resultados
+                                    )
+
+                                    estado["resultados"] = novos_resultados
+                                    estado["fotos_urls"].update(novas_urls)
+                                    estado["erros"] = novos_erros
+                                    st.session_state.analise_em_andamento = estado
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Erro na reanálise: {e}")
+
+                    with col_r2:
+                        if st.button("🗑️ Cancelar análise", use_container_width=True):
+                            st.session_state.analise_em_andamento = None
+                            st.rerun()
+
+                else:
+                    # TUDO OK — gera laudo, salva e mostra
+                    st.markdown("---")
+                    st.success("✅ Todas as peças foram analisadas com sucesso!")
+
+                    texto_laudo = gerar_laudo_consolidado(resultados, formatar_placa(st.session_state.placa_validada))
+
+                    with st.spinner("💾 Salvando análise..."):
+                        ok, erro = salvar_analise_completa(
+                            perfil,
+                            st.session_state.placa_validada,
+                            resultados,
+                            fotos_urls,
+                            texto_laudo,
+                            foto_observacao_url=foto_obs_url,
+                            texto_observacao=texto_obs_salvo,
+                            forcado=st.session_state.forcar_analise
+                        )
+
+                        if ok:
+                            st.success("💾 Análise salva com sucesso!")
+
+                            st.markdown("---")
+                            st.markdown("**📋 Laudo Consolidado**")
+                            st.markdown(texto_laudo)
+
+                            # Botão PDF
+                            ultima_salva = buscar_ultima_analise_placa(st.session_state.placa_validada)
+                            if ultima_salva:
+                                st.markdown("---")
+                                if st.button("📥 Baixar PDF deste laudo", type="primary", key="pdf_pos_analise"):
+                                    with st.spinner("Gerando PDF..."):
+                                        pdf_bytes, erro_pdf = gerar_pdf_analise(ultima_salva)
+                                        if pdf_bytes:
+                                            st.download_button(
+                                                label="💾 Clique para baixar o PDF",
+                                                data=pdf_bytes,
+                                                file_name=f"laudo_{normalizar_placa(ultima_salva['placa'])}_{ultima_salva['id']}.pdf",
+                                                mime="application/pdf",
+                                                key="dl_pos_analise"
+                                            )
+                                        else:
+                                            st.error(f"Erro ao gerar PDF: {erro_pdf}")
+
+                            # Limpa estado
+                            st.session_state.analise_em_andamento = None
+                            st.session_state.forcar_analise = False
+                            st.session_state.placa_validada = None
+                            st.session_state.ultima_analise_placa = None
+                            st.session_state.bloqueado_15dias = False
+                            st.session_state.ver_laudo_anterior = None
+
+                            st.markdown("---")
+                            if st.button("🆕 Fazer nova análise", type="secondary"):
+                                st.rerun()
+                        else:
+                            st.error(f"Análise completa mas não foi possível salvar: {erro}")
+
         else:
             faltando = 9 - total_ok
             if faltando > 0:
                 st.info(f"📸 Faltam **{faltando}** foto(s) válida(s) para liberar a análise.")
-
-        if st.session_state.get("resultado_analise"):
-            res = st.session_state.resultado_analise
-            st.markdown("---")
-            st.subheader(f"📋 Resultado da Análise — {formatar_placa(res['placa'])}")
-
-            for item in CHECKLIST_FOTOS:
-                if not item["analisar"]:
-                    continue
-                r = res["resultados"].get(item["id"])
-                if not r:
-                    continue
-
-                status = r["status"]
-                if status.startswith("TRINCA"):
-                    st.markdown(f'<div class="peca-trinca">🔴 <b>{item["label"]}</b> — {status}<br><small>{r.get("observacao", "")}</small></div>', unsafe_allow_html=True)
-                elif status == "OK":
-                    st.markdown(f'<div class="peca-ok">✅ <b>{item["label"]}</b> — OK</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<div class="peca-ok">🟡 <b>{item["label"]}</b> — {status}</div>', unsafe_allow_html=True)
-
-            st.markdown("---")
-            st.markdown("**📋 Laudo Consolidado**")
-            st.markdown(res["laudo"])
-
-            st.markdown("---")
-            if st.button("🆕 Fazer nova análise", type="primary"):
-                st.session_state.resultado_analise = None
-                st.rerun()
 
 
 # ============================================================
