@@ -4,6 +4,7 @@ import numpy as np
 from PIL import Image
 import re
 import io
+import time
 from datetime import datetime, timezone
 from google import genai
 from supabase import create_client
@@ -50,6 +51,8 @@ def aplicar_estilo():
     .card-contador .sub { color: #9ca3af; font-size: 0.75rem; margin-top: 0.25rem; }
     .peca-ok { background: #d1fae5; padding: 1rem; border-radius: 8px; border-left: 4px solid #10b981; margin-bottom: 0.5rem; }
     .peca-trinca { background: #fee2e2; padding: 1rem; border-radius: 8px; border-left: 4px solid #ef4444; margin-bottom: 0.5rem; }
+    .metricas-ok { color: #10b981; font-size: 0.75rem; font-weight: 600; }
+    .metricas-ruim { color: #ef4444; font-size: 0.75rem; font-weight: 600; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -66,6 +69,13 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # ========== CONSTANTES ==========
 DIAS_MINIMOS_ENTRE_ANALISES = 15
 DOMINIO_FAKE = "@detector.local"
+
+# Limiares de qualidade da foto
+LIMIAR_NITIDEZ = 200      # variância do Laplaciano
+LIMIAR_BRILHO_MIN = 60    # luminância mínima
+LIMIAR_BRILHO_MAX = 200   # luminância máxima
+RESOLUCAO_MIN_LARGURA = 800
+RESOLUCAO_MIN_ALTURA = 600
 
 CHECKLIST_FOTOS = [
     {"id": "foto_pino_rei_1", "status_col": "status_pino_rei_1", "label": "1. Pino-rei — 1ª carreta", "analisar": True},
@@ -266,6 +276,75 @@ def dias_desde(data_iso):
 
 
 # ============================================================
+# FUNÇÃO DE VERIFICAÇÃO DE QUALIDADE DA FOTO
+# ============================================================
+def verificar_qualidade_foto(arquivo_bytes):
+    """
+    Verifica qualidade da foto ANTES de mandar pra IA.
+    Retorna (ok, mensagem, metricas).
+    """
+    try:
+        arr = np.frombuffer(arquivo_bytes, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return False, "Não foi possível ler a imagem", {}
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # 1. Nitidez (variância do Laplaciano)
+        nitidez = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+        # 2. Brilho (luminância média)
+        brilho = float(np.mean(gray))
+
+        # 3. Resolução
+        h, w = img.shape[:2]
+
+        problemas = []
+        if nitidez < LIMIAR_NITIDEZ:
+            problemas.append(f"foto desfocada/borrada (nitidez: {nitidez:.0f})")
+        if brilho < LIMIAR_BRILHO_MIN:
+            problemas.append(f"foto muito escura (brilho: {brilho:.0f})")
+        elif brilho > LIMIAR_BRILHO_MAX:
+            problemas.append(f"foto muito clara/estourada (brilho: {brilho:.0f})")
+        if w < RESOLUCAO_MIN_LARGURA or h < RESOLUCAO_MIN_ALTURA:
+            problemas.append(f"resolução baixa ({w}x{h}, mínimo {RESOLUCAO_MIN_LARGURA}x{RESOLUCAO_MIN_ALTURA})")
+
+        metricas = {
+            "nitidez": nitidez,
+            "brilho": brilho,
+            "resolucao": f"{w}x{h}",
+            "ok_nitidez": nitidez >= LIMIAR_NITIDEZ,
+            "ok_brilho": LIMIAR_BRILHO_MIN <= brilho <= LIMIAR_BRILHO_MAX,
+            "ok_resolucao": w >= RESOLUCAO_MIN_LARGURA and h >= RESOLUCAO_MIN_ALTURA,
+        }
+
+        if problemas:
+            msg = "⚠️ " + " • ".join(problemas)
+            return False, msg, metricas
+
+        return True, "✅ Foto OK", metricas
+    except Exception as e:
+        return False, f"Erro ao verificar: {e}", {}
+
+
+def exibir_metricas(metricas):
+    """Exibe as métricas de qualidade da foto em formato amigável."""
+    if not metricas:
+        return
+    nit_ok = "metricas-ok" if metricas.get("ok_nitidez") else "metricas-ruim"
+    bri_ok = "metricas-ok" if metricas.get("ok_brilho") else "metricas-ruim"
+    res_ok = "metricas-ok" if metricas.get("ok_resolucao") else "metricas-ruim"
+
+    st.markdown(
+        f'<span class="{nit_ok}">Nitidez: {metricas["nitidez"]:.0f}</span> • '
+        f'<span class="{bri_ok}">Brilho: {metricas["brilho"]:.0f}</span> • '
+        f'<span class="{res_ok}">Res: {metricas["resolucao"]}</span>',
+        unsafe_allow_html=True
+    )
+
+
+# ============================================================
 # FUNÇÕES DE ADMIN
 # ============================================================
 def listar_pendentes():
@@ -435,25 +514,26 @@ def fazer_upload_imagem(imagem_np, user_id, nome_arquivo):
 
 
 # ============================================================
-# FUNÇÃO DE ANÁLISE POR PEÇA
+# FUNÇÃO DE ANÁLISE POR PEÇA (COM RETRY)
 # ============================================================
 def analisar_peca(client, img_original_bgr, nome_peca):
     """
     Analisa 1 peça com 2 imagens (original + CLAHE).
-    Retorna: (status, tem_trinca, gravidade, confianca, img_marcada_bgr, obs)
+    Faz retry automático em caso de erro 503.
     """
-    try:
-        img_cinza = cv2.cvtColor(img_original_bgr, cv2.COLOR_BGR2GRAY)
+    max_tentativas = 3
+    espera = 5
 
-        # CLAHE
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        img_clahe = clahe.apply(img_cinza)
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            img_cinza = cv2.cvtColor(img_original_bgr, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            img_clahe = clahe.apply(img_cinza)
 
-        # Prepara imagens pra IA
-        img_a = Image.fromarray(cv2.cvtColor(img_original_bgr, cv2.COLOR_BGR2RGB))
-        img_b = Image.fromarray(img_clahe)
+            img_a = Image.fromarray(cv2.cvtColor(img_original_bgr, cv2.COLOR_BGR2RGB))
+            img_b = Image.fromarray(img_clahe)
 
-        prompt = f"""Você é um inspetor técnico especializado em pino-rei, quinta roda e conjunto de engate de caminhão.
+            prompt = f"""Você é um inspetor técnico especializado em pino-rei, quinta roda e conjunto de engate de caminhão.
 
 Analise APENAS esta peça: {nome_peca}
 
@@ -477,93 +557,99 @@ REGRAS PARA COORDENADAS:
 
 Seja objetivo e técnico."""
 
-        resposta = client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=[prompt, img_a, img_b]
-        )
-        texto = resposta.text
+            resposta = client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=[prompt, img_a, img_b]
+            )
+            texto = resposta.text
 
-        # Extrai status
-        status = "NAO_SEI"
-        match = re.search(r'STATUS:\s*\**\s*(OK|TRINCA_LEVE|TRINCA_MODERADA|TRINCA_SEVERA|NAO_SEI)', texto, re.IGNORECASE)
-        if match:
-            status = match.group(1).upper()
+            # Se chegou aqui, funcionou. Extrai os campos.
+            status = "NAO_SEI"
+            match = re.search(r'STATUS:\s*\**\s*(OK|TRINCA_LEVE|TRINCA_MODERADA|TRINCA_SEVERA|NAO_SEI)', texto, re.IGNORECASE)
+            if match:
+                status = match.group(1).upper()
 
-        tem_trinca = "NÃO SEI"
-        match = re.search(r'TEM TRINCA:\s*\**\s*(SIM|NÃO|NAO|NÃO SEI)', texto, re.IGNORECASE)
-        if match:
-            tem_trinca = match.group(1).upper().replace("NAO", "NÃO")
+            tem_trinca = "NÃO SEI"
+            match = re.search(r'TEM TRINCA:\s*\**\s*(SIM|NÃO|NAO|NÃO SEI)', texto, re.IGNORECASE)
+            if match:
+                tem_trinca = match.group(1).upper().replace("NAO", "NÃO")
 
-        gravidade = "—"
-        match = re.search(r'GRAVIDADE:\s*\**\s*(LEVE|MODERADA|SEVERA|—)', texto, re.IGNORECASE)
-        if match:
-            gravidade = match.group(1).upper()
+            gravidade = "—"
+            match = re.search(r'GRAVIDADE:\s*\**\s*(LEVE|MODERADA|SEVERA|—)', texto, re.IGNORECASE)
+            if match:
+                gravidade = match.group(1).upper()
 
-        confianca = "—"
-        match = re.search(r'CONFIAN[ÇC]A:\s*\**\s*(ALTA|MÉDIA|MEDIA|BAIXA|—)', texto, re.IGNORECASE)
-        if match:
-            confianca = match.group(1).upper().replace("MEDIA", "MÉDIA")
+            confianca = "—"
+            match = re.search(r'CONFIAN[ÇC]A:\s*\**\s*(ALTA|MÉDIA|MEDIA|BAIXA|—)', texto, re.IGNORECASE)
+            if match:
+                confianca = match.group(1).upper().replace("MEDIA", "MÉDIA")
 
-        obs = ""
-        match = re.search(r'OBSERVA[ÇC][ÃA]O:\s*\**\s*(.+)', texto, re.IGNORECASE)
-        if match:
-            obs = match.group(1).strip()
+            obs = ""
+            match = re.search(r'OBSERVA[ÇC][ÃA]O:\s*\**\s*(.+)', texto, re.IGNORECASE)
+            if match:
+                obs = match.group(1).strip()
 
-        # Extrai coordenadas
-        coords = None
-        match = re.search(r'COORDENADAS:\s*\[([\d,\s]+)\]', texto)
-        if match:
-            valores = [int(x.strip()) for x in match.group(1).split(',')]
-            if len(valores) == 4 and sum(valores) > 0:
-                coords = valores
+            coords = None
+            match = re.search(r'COORDENADAS:\s*\[([\d,\s]+)\]', texto)
+            if match:
+                valores = [int(x.strip()) for x in match.group(1).split(',')]
+                if len(valores) == 4 and sum(valores) > 0:
+                    coords = valores
 
-        # Desenha caixa se tiver trinca
-        img_marcada = img_original_bgr.copy()
-        if coords and status.startswith("TRINCA"):
-            y_min, x_min, y_max, x_max = coords
-            h, w = img_original_bgr.shape[:2]
-            x1 = int((x_min / 1000) * w)
-            y1 = int((y_min / 1000) * h)
-            x2 = int((x_max / 1000) * w)
-            y2 = int((y_max / 1000) * h)
+            img_marcada = img_original_bgr.copy()
+            if coords and status.startswith("TRINCA"):
+                y_min, x_min, y_max, x_max = coords
+                h, w = img_original_bgr.shape[:2]
+                x1 = int((x_min / 1000) * w)
+                y1 = int((y_min / 1000) * h)
+                x2 = int((x_max / 1000) * w)
+                y2 = int((y_max / 1000) * h)
 
-            largura_max = int(w * 0.5)
-            altura_max = int(h * 0.5)
-            if (x2 - x1) > largura_max:
-                cx = (x1 + x2) // 2
-                x1 = cx - largura_max // 2
-                x2 = cx + largura_max // 2
-            if (y2 - y1) > altura_max:
-                cy = (y1 + y2) // 2
-                y1 = cy - altura_max // 2
-                y2 = cy + altura_max // 2
+                largura_max = int(w * 0.5)
+                altura_max = int(h * 0.5)
+                if (x2 - x1) > largura_max:
+                    cx = (x1 + x2) // 2
+                    x1 = cx - largura_max // 2
+                    x2 = cx + largura_max // 2
+                if (y2 - y1) > altura_max:
+                    cy = (y1 + y2) // 2
+                    y1 = cy - altura_max // 2
+                    y2 = cy + altura_max // 2
 
-            x1 = max(0, min(x1, w - 1))
-            y1 = max(0, min(y1, h - 1))
-            x2 = max(0, min(x2, w - 1))
-            y2 = max(0, min(y2, h - 1))
+                x1 = max(0, min(x1, w - 1))
+                y1 = max(0, min(y1, h - 1))
+                x2 = max(0, min(x2, w - 1))
+                y2 = max(0, min(y2, h - 1))
 
-            cv2.rectangle(img_marcada, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            cv2.putText(img_marcada, "TRINCA", (x1, max(y1 - 10, 20)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.rectangle(img_marcada, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                cv2.putText(img_marcada, "TRINCA", (x1, max(y1 - 10, 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-        return {
-            "status": status,
-            "tem_trinca": tem_trinca,
-            "gravidade": gravidade,
-            "confianca": confianca,
-            "observacao": obs,
-            "img_marcada": img_marcada,
-        }
-    except Exception as e:
-        return {
-            "status": "ERRO",
-            "tem_trinca": "NÃO SEI",
-            "gravidade": "—",
-            "confianca": "—",
-            "observacao": f"Erro: {e}",
-            "img_marcada": img_original_bgr.copy(),
-        }
+            return {
+                "status": status,
+                "tem_trinca": tem_trinca,
+                "gravidade": gravidade,
+                "confianca": confianca,
+                "observacao": obs,
+                "img_marcada": img_marcada,
+            }
+
+        except Exception as e:
+            erro_str = str(e)
+            if "503" in erro_str and tentativa < max_tentativas:
+                time.sleep(espera)
+                continue
+            elif "429" in erro_str and tentativa < max_tentativas:
+                time.sleep(espera * 2)
+                continue
+            return {
+                "status": "ERRO",
+                "tem_trinca": "NÃO SEI",
+                "gravidade": "—",
+                "confianca": "—",
+                "observacao": f"Erro após {tentativa} tentativa(s): {erro_str[:100]}",
+                "img_marcada": img_original_bgr.copy(),
+            }
 
 
 def gerar_laudo_consolidado(resultados, placa):
@@ -571,7 +657,9 @@ def gerar_laudo_consolidado(resultados, placa):
     linhas = [f"LAUDO DE INSPEÇÃO — PLACA {placa}", ""]
 
     tem_trinca_geral = False
+    tem_erro = False
     pecas_com_trinca = []
+    pecas_com_erro = []
     gravidades = []
     confiancas = []
 
@@ -583,7 +671,11 @@ def gerar_laudo_consolidado(resultados, placa):
             continue
 
         status = res["status"]
-        if status.startswith("TRINCA"):
+        if status == "ERRO":
+            emoji = "🟡"
+            tem_erro = True
+            pecas_com_erro.append(f"{i+1}. {item['label']}")
+        elif status.startswith("TRINCA"):
             emoji = "🔴"
             tem_trinca_geral = True
             pecas_com_trinca.append(f"{i+1}. {item['label']}")
@@ -601,29 +693,32 @@ def gerar_laudo_consolidado(resultados, placa):
         if res["confianca"] != "—":
             confiancas.append(res["confianca"])
 
-    # Resumo
     linhas.append("")
     linhas.append("RESUMO:")
-    linhas.append(f"1. TEM TRINCA? {'SIM' if tem_trinca_geral else 'NÃO'}")
+
+    if tem_erro:
+        linhas.append(f"⚠️ ANÁLISE INCOMPLETA — {len(pecas_com_erro)} peça(s) não puderam ser analisadas")
+        linhas.append(f"   Peças com erro: {', '.join(pecas_com_erro)}")
+        linhas.append("   Recomendação: Refazer a análise dessas peças manualmente")
+        linhas.append("")
+
+    linhas.append(f"1. TEM TRINCA? {'SIM' if tem_trinca_geral else ('NÃO SEI' if tem_erro else 'NÃO')}")
     if pecas_com_trinca:
         linhas.append(f"2. Peças com trinca: {', '.join(pecas_com_trinca)}")
     else:
         linhas.append("2. Peças com trinca: nenhuma")
 
     if gravidades:
-        # Pega a gravidade máxima
         prioridade = {"SEVERA": 3, "MODERADA": 2, "LEVE": 1}
         grav_max = max(gravidades, key=lambda g: prioridade.get(g, 0))
         linhas.append(f"3. Gravidade geral: {grav_max}")
         if grav_max == "SEVERA":
             linhas.append("4. Recomendação: SUBSTITUIR")
-        elif grav_max == "MODERADA":
-            linhas.append("4. Recomendação: INSPECIONAR")
         else:
             linhas.append("4. Recomendação: INSPECIONAR")
     else:
         linhas.append("3. Gravidade geral: —")
-        linhas.append("4. Recomendação: LIBERAR")
+        linhas.append("4. Recomendação: LIBERAR" if not tem_erro else "4. Recomendação: REFAZER ANÁLISE")
 
     if confiancas:
         if "BAIXA" in confiancas:
@@ -650,7 +745,7 @@ def extrair_campos_laudo(texto):
     if match:
         campos["gravidade"] = match.group(1).upper()
 
-    match = re.search(r'Recomenda[çc][ãa]o[:\s]*\**\s*(LIBERAR|INSPECIONAR|SUBSTITUIR)', texto, re.IGNORECASE)
+    match = re.search(r'Recomenda[çc][ãa]o[:\s]*\**\s*(LIBERAR|INSPECIONAR|SUBSTITUIR|REFAZER)', texto, re.IGNORECASE)
     if match:
         campos["recomendacao"] = match.group(1).upper()
 
@@ -682,11 +777,9 @@ def salvar_analise_completa(perfil, placa, resultados, fotos_urls, texto_laudo, 
         dados["recomendacao"] = campos["recomendacao"]
         dados["confianca"] = campos["confianca"]
 
-        # URLs das fotos (marcadas)
         for item in CHECKLIST_FOTOS:
             dados[item["id"]] = fotos_urls.get(item["id"])
 
-        # Status por peça
         for item in CHECKLIST_FOTOS:
             if item["status_col"]:
                 res = resultados.get(item["id"])
@@ -1181,7 +1274,6 @@ def gerar_pdf_analise(analise):
         elementos.append(t)
         elementos.append(Spacer(1, 15))
 
-        # ========== TABELA DE STATUS POR PEÇA ==========
         elementos.append(Paragraph("🔍 Status por Peça", estilo_sub))
 
         tabela_pecas = [["Peça", "Status"]]
@@ -1205,7 +1297,6 @@ def gerar_pdf_analise(analise):
         elementos.append(tp)
         elementos.append(Spacer(1, 15))
 
-        # ========== FOTOS ==========
         elementos.append(Paragraph("📸 Fotos da Inspeção", estilo_sub))
 
         fotos_validas = [(item["label"], analise.get(item["id"])) for item in CHECKLIST_FOTOS if analise.get(item["id"])]
@@ -1282,7 +1373,7 @@ def gerar_pdf_analise(analise):
 
 
 # ============================================================
-# TELA DE ANÁLISE (1 PEÇA POR VEZ)
+# TELA DE ANÁLISE (1 PEÇA POR VEZ + VERIFICAÇÃO DE QUALIDADE)
 # ============================================================
 def tela_analise(perfil):
     st.title("🔍 Detector de Trinca")
@@ -1391,13 +1482,27 @@ def tela_analise(perfil):
         st.markdown("---")
         st.markdown("### 📸 Checklist de Fotos")
         st.caption("Todas as 9 fotos são obrigatórias. A IA analisa as 8 primeiras (a placa é só registro).")
+        st.caption("📋 **Critérios de qualidade:** nitidez mínima, brilho adequado e resolução ≥ 800x600.")
 
         if st.session_state.forcar_analise:
             st.warning("⚠️ Análise FORÇADA (fora do prazo de 15 dias)")
 
+        # Admin pode desabilitar a verificação de qualidade
+        pular_verificacao = False
+        if perfil["role"] == "admin":
+            pular_verificacao = st.checkbox(
+                "🛡️ Admin: pular verificação de qualidade das fotos",
+                value=False,
+                key="pular_verificacao_admin"
+            )
+            if pular_verificacao:
+                st.warning("⚠️ Verificação de qualidade DESATIVADA pelo admin. Fotos ruins podem ir pra IA.")
+
         # Upload em grid 3x3
         fotos_upload = {}
+        fotos_qualidade = {}
         total_ok = 0
+        total_ruim = 0
 
         for linha in range(3):
             cols = st.columns(3)
@@ -1416,14 +1521,39 @@ def tela_analise(perfil):
                         label_visibility="collapsed"
                     )
                     if arquivo:
-                        fotos_upload[item["id"]] = arquivo
-                        st.session_state[f"uploaded_{item['id']}"] = True
-                        total_ok += 1
+                        # Verifica qualidade
+                        if pular_verificacao:
+                            ok_q, msg_q, metricas_q = True, "✅ Verificação pulada (admin)", {}
+                        else:
+                            ok_q, msg_q, metricas_q = verificar_qualidade_foto(arquivo.getvalue())
+
+                        fotos_qualidade[item["id"]] = {
+                            "ok": ok_q,
+                            "msg": msg_q,
+                            "metricas": metricas_q,
+                        }
+
+                        if ok_q:
+                            fotos_upload[item["id"]] = arquivo
+                            st.session_state[f"uploaded_{item['id']}"] = True
+                            total_ok += 1
+                            st.markdown(f'<span class="metricas-ok">✅ Qualidade OK</span>', unsafe_allow_html=True)
+                            if metricas_q:
+                                exibir_metricas(metricas_q)
+                        else:
+                            st.session_state[f"uploaded_{item['id']}"] = False
+                            total_ruim += 1
+                            st.error(f"❌ {msg_q}")
+                            if metricas_q:
+                                exibir_metricas(metricas_q)
                     else:
                         st.session_state[f"uploaded_{item['id']}"] = False
 
         st.markdown("---")
-        st.markdown(f"**Progresso:** {total_ok}/9 fotos anexadas")
+        st.markdown(f"**Progresso:** {total_ok}/9 fotos válidas")
+
+        if total_ruim > 0:
+            st.warning(f"⚠️ {total_ruim} foto(s) com qualidade ruim. Corrija antes de analisar.")
 
         with st.expander("📝 Observação (opcional)", expanded=False):
             foto_obs = st.file_uploader(
@@ -1437,7 +1567,7 @@ def tela_analise(perfil):
                 key="texto_observacao_input"
             )
 
-        # Botão Analisar
+        # Botão Analisar (só libera se todas as 9 estão OK)
         if total_ok == 9:
             st.markdown("---")
             if st.button("🔎 Analisar com IA", type="primary", use_container_width=True):
@@ -1457,7 +1587,6 @@ def tela_analise(perfil):
                                 img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
                                 fotos_brutas[item["id"]] = img
 
-                        # Upload da observação
                         foto_obs_url = None
                         if foto_obs:
                             bytes_obs = foto_obs.read()
@@ -1483,11 +1612,9 @@ def tela_analise(perfil):
                             resultado = analisar_peca(client, img_original, item["label"])
                             resultados[item["id"]] = resultado
 
-                            # Upload da foto marcada
                             url_marcada, _ = fazer_upload_imagem(resultado["img_marcada"], perfil["id"], item["id"])
                             fotos_urls[item["id"]] = url_marcada
 
-                            # Mostra resultado parcial
                             if resultado["status"].startswith("TRINCA"):
                                 status_texto.markdown(f"**Analisando peça {i+1}/{total_pecas}:** {item['label']}... 🔴 **TRINCA**")
                             elif resultado["status"] == "OK":
@@ -1497,17 +1624,15 @@ def tela_analise(perfil):
 
                             barra_progresso.progress((i + 1) / total_pecas)
 
-                        # Upload da placa (não analisada)
+                        # Upload da placa
                         if "foto_placa" in fotos_brutas:
                             url_placa, _ = fazer_upload_imagem(fotos_brutas["foto_placa"], perfil["id"], "foto_placa")
                             fotos_urls["foto_placa"] = url_placa
 
                         status_texto.markdown("**✅ Análise concluída!**")
 
-                        # ========== LAUDO CONSOLIDADO ==========
                         texto_laudo = gerar_laudo_consolidado(resultados, formatar_placa(st.session_state.placa_validada))
 
-                        # ========== SALVA NO BANCO ==========
                         with st.spinner("💾 Salvando análise..."):
                             ok, erro = salvar_analise_completa(
                                 perfil,
@@ -1522,7 +1647,6 @@ def tela_analise(perfil):
 
                             if ok:
                                 st.success("💾 Análise salva com sucesso!")
-                                # Guarda resultado pra exibir
                                 st.session_state.resultado_analise = {
                                     "resultados": resultados,
                                     "laudo": texto_laudo,
@@ -1539,6 +1663,10 @@ def tela_analise(perfil):
 
                     except Exception as e:
                         st.error(f"Erro na análise: {e}")
+        else:
+            faltando = 9 - total_ok
+            if faltando > 0:
+                st.info(f"📸 Faltam **{faltando}** foto(s) válida(s) para liberar a análise.")
 
         # ========== MOSTRA RESULTADO SE TIVER ==========
         if st.session_state.get("resultado_analise"):
@@ -1546,7 +1674,6 @@ def tela_analise(perfil):
             st.markdown("---")
             st.subheader(f"📋 Resultado da Análise — {formatar_placa(res['placa'])}")
 
-            # Tabela de status
             for item in CHECKLIST_FOTOS:
                 if not item["analisar"]:
                     continue
